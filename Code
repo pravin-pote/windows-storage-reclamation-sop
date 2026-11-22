@@ -1,0 +1,199 @@
+# Windows 11 Storage Audit & Reclamation SOP
+
+![OS](https://img.shields.io/badge/OS-Windows%2011-0078D6?logo=windows)
+![Shell](https://img.shields.io/badge/Shell-CMD%20%7C%20PowerShell-5391FE?logo=powershell)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+A command-line Standard Operating Procedure (SOP) for diagnosing hidden disk utilization on Windows 11, bypassing `SYSTEM`-locked vendor bloatware directories, and reclaiming gigabytes of storage without third-party "PC cleaner" apps.
+
+---
+
+## Case Study Results (500 GB NVMe SSD)
+
+Standard Windows Settings and installed-application lists only accounted for **~35–40 GB** of used space on a drive that had **92 GB free**. Deep CLI auditing uncovered over **130+ GB** of hidden, `SYSTEM`-locked vendor recovery snapshots (`Dell SupportAssist Remediation`) alongside stale developer caches and system files.
+
+| Metric | Before Cleanup | After Cleanup | Net Change |
+| :--- | :---: | :---: | :---: |
+| **Used Space (`C:`)** | ~363.1 GB | 206.3 GB | **-156.8 GB** |
+| **Free Space (`C:`)** | 92.0 GB | 248.8 GB | **+156.8 GB** |
+| **Drive Utilization** | ~80% (Sluggish I/O) | ~45% (Optimal) | **-35% Load** |
+
+---
+
+## Root Cause Breakdown
+
+Why standard Windows tools miss the majority of consumed storage:
+
+1. **Locked Vendor Snapshots (`C:\ProgramData\Dell\SARemediation`):** Dell SupportAssist Remediation creates hidden, redundant OS snapshots under `SYSTEM` ownership. Standard tools (`Disk Cleanup`, `Storage Sense`, and non-elevated scans) cannot read or delete these directories, allowing them to silently consume **100+ GB**.
+2. **Untracked Developer Artifacts:** Tools like **Ollama** (`.ollama` LLM weights), **Anaconda3**, **WSL** (`.vhdx`), and **VirtualBox** (`.vdi`) often report `0 MB` or minimal sizes in the Windows Registry while storing tens of gigabytes in user profile directories.
+3. **System & Package Caches:** `hiberfil.sys`, `pip` wheel caches, leftover MSI installers, and browser caches quietly accumulate another **15–30 GB**.
+
+---
+
+## Disclaimer & Safety Warning
+
+> **Read before executing:** Several commands in this SOP permanently delete files (bypassing the Recycle Bin) using elevated `Administrator` and `SYSTEM` privileges.
+> * Back up important projects, local LLM models, virtual machines, or Conda environments before running cleanup commands.
+> * Never modify or delete `C:\Windows\System32`, `C:\Windows\Installer`, `C:\Program Files\WindowsApps`, or `pagefile.sys`.
+> * Execute all commands inside an **Administrator: Command Prompt** (`Win` → `cmd` → **Run as administrator**).
+
+---
+
+## Quick Start: Read-Only Audit Script
+
+Before deleting anything, you can run the included read-only PowerShell audit script (`scripts/audit-storage.ps1`) from an **Administrator PowerShell** window to map your drive safely:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\audit-storage.ps1
+```
+
+---
+
+## Phase 1: Storage Diagnostics & Auditing
+
+### 1.1 Check Current Drive Utilization
+```cmd
+powershell -Command "Get-PSDrive C | Select-Object @{N='Used(GB)';E={[math]::Round($_.Used/1GB,2)}}, @{N='Free(GB)';E={[math]::Round($_.Free/1GB,2)}}"
+```
+
+### 1.2 Export Installed Applications Report (OneDrive-Safe Path)
+Exports all registry-tracked applications sorted by size to your actual Desktop path (works even when OneDrive Folder Backup is enabled).
+```cmd
+powershell -Command "Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | Select-Object DisplayName, @{Name='Size(MB)';Expression={[math]::Round($_.EstimatedSize / 1024, 2)}} | Sort-Object 'Size(MB)' -Descending | Format-Table -AutoSize | Out-File ([Environment]::GetFolderPath('Desktop') + '\AppsReport.txt')"
+```
+
+### 1.3 Audit Windows Volume Shadow Copies (System Restore)
+Verify whether Windows' native System Restore is consuming hidden space:
+```cmd
+vssadmin list shadowstorage
+```
+
+### 1.4 Inspect Hidden Root Files (`hiberfil.sys` / `pagefile.sys`)
+```cmd
+dir /a C:\
+```
+
+### 1.5 Scan Top 15 Largest `AppData` Directories
+```cmd
+powershell -Command "Get-ChildItem $env:LOCALAPPDATA, $env:APPDATA -Directory -ErrorAction SilentlyContinue | ForEach-Object { $s = (Get-ChildItem $_.FullName -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum; [PSCustomObject]@{ Folder = $_.FullName; 'Size(GB)' = [math]::Round($s / 1GB, 2) } } | Sort-Object 'Size(GB)' -Descending | Select-Object -First 15 | Format-Table -AutoSize"
+```
+
+### 1.6 Scan Top 15 System & Program Directories
+*(Note: `C:\Users\All Users` is a system junction pointing to `C:\ProgramData`—do not count or delete it separately.)*
+```cmd
+powershell -Command "Get-ChildItem 'C:\ProgramData','C:\Program Files','C:\Program Files (x86)','C:\Windows','C:\Users' -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $env:USERPROFILE } | ForEach-Object { $s = (Get-ChildItem $_.FullName -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum; [PSCustomObject]@{ Folder = $_.FullName; 'Size(GB)' = [math]::Round($s / 1GB, 2) } } | Sort-Object 'Size(GB)' -Descending | Select-Object -First 15 | Format-Table -AutoSize"
+```
+
+---
+
+## Phase 2: Removing `SYSTEM`-Locked Vendor Bloat (`SARemediation`)
+
+### Why `takeown` and `icacls` Fail at Scale
+`C:\ProgramData\Dell\SARemediation\SystemRepair\Snapshots\Backup` contains hundreds of thousands of small backup files locked under `SYSTEM` permissions. Running `takeown /f ... /r` processes files single-threaded and can stall for 30+ minutes.
+
+### The Fast Fix: Multi-Threaded `robocopy` Purge as `SYSTEM`
+
+1. **Uninstall the Dell Remediation apps first** via **Settings → Apps → Installed apps** so the background driver stops recreating snapshots:
+   * `Dell SupportAssist OS Recovery Plugin for Dell Update`
+   * `Dell SupportAssist Remediation`
+   * `Dell SupportAssist`
+
+2. **Stop any running Dell services:**
+   ```cmd
+   powershell -Command "Get-Service *Dell*, *SupportAssist* -ErrorAction SilentlyContinue | Stop-Service -Force -ErrorAction SilentlyContinue"
+   ```
+
+3. **Create a temporary empty directory and trigger a 32-thread `SYSTEM` mirror purge:**
+   ```cmd
+   mkdir C:\EmptyTemp
+   schtasks /create /tn DelDell /tr "cmd /c robocopy C:\EmptyTemp C:\ProgramData\Dell\SARemediation /MIR /MT:32 /R:0 /W:0 /NFL /NDL /NJH /NJS & rmdir /s /q C:\ProgramData\Dell\SARemediation & rmdir /s /q C:\EmptyTemp" /sc once /st 00:00 /ru SYSTEM /f
+   schtasks /run /tn DelDell
+   ```
+
+4. **Monitor completion:**
+   ```cmd
+   tasklist /fi "imagename eq robocopy.exe"
+   ```
+   Wait until the output returns: `INFO: No tasks are running which match the specified criteria.`
+
+5. **Clean up the temporary task and verify removal:**
+   ```cmd
+   schtasks /delete /tn DelDell /f
+   rmdir /s /q C:\EmptyTemp "C:\ProgramData\Dell\SARemediation" 2>nul & dir "C:\ProgramData\Dell\SARemediation"
+   ```
+   Expected output: `File Not Found`.
+
+---
+
+## Phase 3: Developer Tools & Cache Cleanup
+
+### 3.1 Remove Ollama App & Local LLM Weights
+```cmd
+taskkill /f /im ollama.exe /im "ollama app.exe" 2>nul
+rmdir /s /q "%USERPROFILE%\.ollama"
+"%LOCALAPPDATA%\Programs\Ollama\unins000.exe"
+```
+
+### 3.2 Remove Unused WSL Distributions & Disable Feature
+```cmd
+wsl -l -v
+:: If a distro exists, unregister it first:
+:: wsl --unregister <DistroName>
+dism.exe /online /disable-feature /featurename:Microsoft-Windows-Subsystem-Linux /norestart
+```
+
+### 3.3 Replace Heavy Anaconda3 (~10–30 GB) with Lightweight Jupyter (~200 MB)
+1. Uninstall **Anaconda3** from **Settings → Apps → Installed apps**.
+2. Clear leftover Conda directories:
+   ```cmd
+   rmdir /s /q "%USERPROFILE%\anaconda3" "%USERPROFILE%\.conda" "%LOCALAPPDATA%\conda"
+   ```
+3. Install standalone Jupyter Notebook on your existing Python installation:
+   ```cmd
+   pip install notebook
+   ```
+
+### 3.4 Purge Package Caches, Stale Installers, & Recycle Bin
+```cmd
+rmdir /s /q "%LOCALAPPDATA%\pip\cache" "%LOCALAPPDATA%\Downloaded Installations"
+powershell -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"
+```
+
+---
+
+## Phase 4: Windows System Optimization
+
+1. **Disable Hibernation (Reclaims `hiberfil.sys`, ~6–16 GB):**
+   *(Only run if you do not use Hibernate mode.)*
+   ```cmd
+   powercfg -h off
+   ```
+2. **Clean Superseded Windows Update Components (`WinSxS`):**
+   ```cmd
+   Dism.exe /online /Cleanup-Image /StartComponentCleanup
+   ```
+3. **Reboot Windows** to unload disabled features and flush system memory.
+
+---
+
+## Phase 5: Real-Time CLI Monitoring (Linux `watch` / `mpstat` / `htop` Equivalents)
+
+* **Live Disk & Process Monitor (`watch -n 2` equivalent):**
+  ```cmd
+  powershell -Command "while($true){ cls; Get-PSDrive C | Select-Object @{N='Used(GB)';E={[math]::Round($_.Used/1GB,2)}}, @{N='Free(GB)';E={[math]::Round($_.Free/1GB,2)}}; Get-Process robocopy -ErrorAction SilentlyContinue | Select-Object Name, Id, @{N='RAM(MB)';E={[math]::Round($_.WS/1MB,1)}}; Start-Sleep 2 }"
+  ```
+* **Live CPU, RAM, & Disk Telemetry (`mpstat` equivalent):**
+  ```cmd
+  typeperf "\Processor(_Total)\% Processor Time" "\Memory\% Committed Bytes In Use" "\LogicalDisk(C:)\% Disk Time" "\LogicalDisk(C:)\Free Megabytes" -si 2
+  ```
+* **Interactive Terminal Dashboard (`htop` equivalent):**
+  ```cmd
+  winget install aristocratos.btop4win
+  btop
+  ```
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
